@@ -43,6 +43,15 @@ By using this software, you acknowledge that you have read, understood, and agre
 Name : Travis Johnston as Kate Johnston
 Date: 14/08/2025
 
+# Best: auto-pick your CPU features
+g++ -O3 -march=native -std=c++20 human_conscious.cpp -o human_conscious
+
+# If your toolchain is picky:
+# AVX2:  g++ -O3 -mavx2   -std=c++20 human_conscious.cpp -o human_conscious
+# Scalar fallback only:    g++ -O3           -std=c++20 human_conscious.cpp -o human_conscious
+
+./human_conscious
+
 // human_conscious.cpp
 // Human-like “conscious core” with cognition + feelings + drives + personality,
 // SIMD-accelerated state updates (AVX-512 / AVX2) with scalar fallback.
