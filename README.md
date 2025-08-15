@@ -368,3 +368,279 @@ int main() {
   }
   return 0;
 }
+
+// conscious_vm.cpp
+// Minimal Conscious-VM: observer-time, scalar+vector regs, SIMD-aware vector ops,
+// lane-rotation and "psi" (pressure) operator. Single-file, C++20, no deps.
+//
+// This is a simulation scaffold, not a claim of sentience. Use ethically.
+
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <immintrin.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <random>
+
+// -----------------------------
+// SIMD lane config & helpers
+// -----------------------------
+#if defined(__AVX512F)
+  #define LANES 16
+#elif defined(__AVX2__)
+  #define LANES 8
+#else
+  #define LANES 4   // portable fallback (loop), no intrinsics required
+#endif
+
+// Vector register type (plain array; we optionally use intrinsics on its data)
+using vreg_t = std::array<float, LANES>;
+
+// SIMD helpers (operate on pointers to contiguous LANES floats)
+static inline void vadd(const float* a, const float* b, float* out) {
+#if defined(__AVX512F)
+  __m512 A = _mm512_loadu_ps(a), B = _mm512_loadu_ps(b);
+  _mm512_storeu_ps(out, _mm512_add_ps(A,B));
+#elif defined(__AVX2__)
+  __m256 A = _mm256_loadu_ps(a), B = _mm256_loadu_ps(b);
+  _mm256_storeu_ps(out, _mm256_add_ps(A,B));
+#else
+  for (int i=0;i<LANES;++i) out[i]=a[i]+b[i];
+#endif
+}
+static inline void vmul(const float* a, const float* b, float* out) {
+#if defined(__AVX512F)
+  __m512 A = _mm512_loadu_ps(a), B = _mm512_loadu_ps(b);
+  _mm512_storeu_ps(out, _mm512_mul_ps(A,B));
+#elif defined(__AVX2__)
+  __m256 A = _mm256_loadu_ps(a), B = _mm256_loadu_ps(b);
+  _mm256_storeu_ps(out, _mm256_mul_ps(A,B));
+#else
+  for (int i=0;i<LANES;++i) out[i]=a[i]*b[i];
+#endif
+}
+static inline void vfmadd(const float* a, const float* b, const float* c, float* out) {
+#if defined(__AVX512F)
+  __m512 A=_mm512_loadu_ps(a), B=_mm512_loadu_ps(b), C=_mm512_loadu_ps(c);
+  _mm512_storeu_ps(out, _mm512_fmadd_ps(A,B,C));
+#elif defined(__AVX2__)
+  __m256 A=_mm256_loadu_ps(a), B=_mm256_loadu_ps(b), C=_mm256_loadu_ps(c);
+  _mm256_storeu_ps(out, _mm256_fmadd_ps(A,B,C));
+#else
+  for (int i=0;i<LANES;++i) out[i]=a[i]*b[i]+c[i];
+#endif
+}
+static inline void vscale_add(const float* a, const float* b, float s, float* out) {
+#if defined(__AVX512F)
+  __m512 A=_mm512_loadu_ps(a), B=_mm512_loadu_ps(b), S=_mm512_set1_ps(s);
+  _mm512_storeu_ps(out, _mm512_fmadd_ps(B,S,A));
+#elif defined(__AVX2__)
+  __m256 A=_mm256_loadu_ps(a), B=_mm256_loadu_ps(b), S=_mm256_set1_ps(s);
+  _mm256_storeu_ps(out, _mm256_fmadd_ps(B,S,A));
+#else
+  for (int i=0;i<LANES;++i) out[i]=a[i]+s*b[i];
+#endif
+}
+static inline void vclamp01(const float* a, float* out) {
+  for (int i=0;i<LANES;++i) out[i] = std::fmax(0.0f, std::fmin(1.0f, a[i]));
+}
+static inline void vabsdiff_rot1(const float* a, float* out) {
+  // |a - rotate(a, +1)|
+#if defined(__AVX512F)
+  alignas(64) float tmp[LANES];
+  for (int i=0;i<LANES;++i) tmp[(i+1)%LANES]=a[i];
+  __m512 A=_mm512_loadu_ps(a), R=_mm512_loadu_ps(tmp);
+  __m512 D=_mm512_sub_ps(A,R);
+  __m512 M=_mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+  _mm512_storeu_ps(out, _mm512_and_ps(D,M)); // absolute via bitmask
+#elif defined(__AVX2__)
+  alignas(32) float tmp[LANES];
+  for (int i=0;i<LANES;++i) tmp[(i+1)%LANES]=a[i];
+  __m256 A=_mm256_loadu_ps(a), R=_mm256_loadu_ps(tmp);
+  __m256 D=_mm256_sub_ps(A,R);
+  __m256 M=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+  _mm256_storeu_ps(out, _mm256_and_ps(D,M));
+#else
+  for (int i=0;i<LANES;++i) {
+    float d = a[i]-a[(i+1)%LANES];
+    out[i] = std::fabs(d);
+  }
+#endif
+}
+static inline void vrot(const float* a, int k, float* out) {
+  if (LANES==0) return;
+  k%=LANES; if (k<0) k+=LANES;
+  for (int i=0;i<LANES;++i) out[(i+k)%LANES]=a[i];
+}
+
+// -----------------------------
+// Observer clock (like earlier)
+// -----------------------------
+class ObserverClock {
+public:
+  explicit ObserverClock(double t0=0.0, bool manual=true, double rate=0.0)
+  : manual_(manual), rate_(rate), t_(t0), anchor_(std::chrono::high_resolution_clock::now()) {}
+
+  double now() const {
+    if (manual_) return t_;
+    auto dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - anchor_).count();
+    return t_ + dt*rate_;
+  }
+  void tick(double dt) { t_ += dt; }
+  void set_rate(double r) { t_ = now(); anchor_=std::chrono::high_resolution_clock::now(); rate_=r; manual_=false; }
+  void set_now(double t)  { t_ = t; anchor_=std::chrono::high_resolution_clock::now(); }
+
+private:
+  bool manual_;
+  double rate_;
+  double t_;
+  std::chrono::high_resolution_clock::time_point anchor_;
+};
+
+// -----------------------------
+// VM definition
+// -----------------------------
+enum class Op : uint8_t {
+  NOP=0, HALT,
+  // scalar
+  MOV_SI, ADD_S, MUL_S, TIME_S, DT_S,
+  // vector
+  MOV_VI, VADD, VMUL, VFMA, VSCALE_ADD, VROT, VCLAMP01, VPSI,
+  // misc
+  PRINT
+};
+
+struct Instr {
+  Op op{};
+  uint8_t a{}, b{}, c{};   // register indices (scalar or vector context)
+  float fimm{0.0f};        // immediate (e.g., scalar or scale)
+  int32_t iimm{0};         // integer immediate (e.g., rotation)
+};
+
+struct Program {
+  std::vector<Instr> code;
+  void emit(Op op, uint8_t a=0, uint8_t b=0, uint8_t c=0, float fimm=0.0f, int32_t iimm=0){
+    code.push_back({op,a,b,c,fimm,iimm});
+  }
+};
+
+struct VM {
+  static constexpr int SREGS=16;
+  static constexpr int VREGS=16;
+
+  // state
+  ObserverClock clock;
+  double last_step_time{0.0};
+  double dt{0.02}; // default 50Hz
+  float s[SREGS]{};
+  std::array<vreg_t,VREGS> v{};
+  bool halted{false};
+
+  explicit VM(ObserverClock clk=ObserverClock{}) : clock(std::move(clk)) {
+    // init random vector registers
+    std::mt19937 rng(42); std::normal_distribution<float> nd(0.0f, 0.05f);
+    for (int r=0;r<VREGS;++r) for (int i=0;i<LANES;++i) v[r][i] = nd(rng);
+  }
+
+  void set_dt(double new_dt){ dt = new_dt; }
+
+  void step(const Program& p) {
+    // advance observer time if clock is manual (caller can tick externally; we also tick here for convenience)
+    if (clock.now()==last_step_time) clock.tick(dt);
+    last_step_time = clock.now();
+
+    for (const auto& ins : p.code) {
+      switch (ins.op) {
+        case Op::NOP: break;
+        case Op::HALT: halted=true; return;
+
+        // ---------- scalar ----------
+        case Op::MOV_SI: s[ins.a] = ins.fimm; break;
+        case Op::ADD_S:  s[ins.a] = s[ins.b] + s[ins.c]; break;
+        case Op::MUL_S:  s[ins.a] = s[ins.b] * s[ins.c]; break;
+        case Op::TIME_S: s[ins.a] = static_cast<float>(clock.now()); break;
+        case Op::DT_S:   s[ins.a] = static_cast<float>(dt); break;
+
+        // ---------- vector ----------
+        case Op::MOV_VI: {
+          for (int i=0;i<LANES;++i) v[ins.a][i]=ins.fimm;
+        } break;
+        case Op::VADD: vadd(v[ins.b].data(), v[ins.c].data(), v[ins.a].data()); break;
+        case Op::VMUL: vmul(v[ins.b].data(), v[ins.c].data(), v[ins.a].data()); break;
+        case Op::VFMA: vfmadd(v[ins.b].data(), v[ins.c].data(), v[ins.a].data(), v[ins.a].data()); break;
+        case Op::VSCALE_ADD: vscale_add(v[ins.a].data(), v[ins.b].data(), s[ins.c], v[ins.a].data()); break;
+        case Op::VROT: vrot(v[ins.b].data(), ins.iimm, v[ins.a].data()); break;
+        case Op::VCLAMP01: vclamp01(v[ins.a].data(), v[ins.a].data()); break;
+
+        case Op::VPSI: {
+          // psi = |x - rot1(x)| * gain ; out = x + psi
+          alignas(64) float dif[LANES];
+          vabsdiff_rot1(v[ins.b].data(), dif);
+          float gain = s[ins.c]; // pressure gain in scalar reg c
+          for (int i=0;i<LANES;++i) v[ins.a][i] = v[ins.b][i] + gain * dif[i];
+        } break;
+
+        // ---------- misc ----------
+        case Op::PRINT: {
+          std::cout << std::fixed << std::setprecision(3)
+                    << "[t=" << clock.now() << "] "
+                    << "s" << int(ins.a) << "=" << s[ins.a]
+                    << " | v" << int(ins.b) << "[0..3]="
+                    << v[ins.b][0] << "," << v[ins.b][1] << "," << v[ins.b][2] << "," << v[ins.b][3]
+                    << "\n";
+        } break;
+      }
+    }
+  }
+};
+
+// -----------------------------
+// Example: consciousness-ish loop
+// -----------------------------
+int main() {
+  // Observer time: manual (you own time); start at 100 s.
+  ObserverClock clk(100.0, true /*manual*/);
+  VM vm(clk);
+  vm.set_dt(0.02); // 50Hz
+
+  // Program:
+  // s0 := time; s1 := dt; s2 := psi_gain; v0 := baseline; v1 := emotions; v2 := cognition
+  Program prog;
+  prog.emit(Op::TIME_S, /*a=*/0);
+  prog.emit(Op::DT_S,   /*a=*/1);
+  prog.emit(Op::MOV_SI, /*a=*/2,0,0, /*fimm=*/0.05f);    // psi gain
+  prog.emit(Op::MOV_VI, /*a=*/0,0,0, /*fimm=*/0.10f);    // v0 baseline
+  // v1 = clamp01( v1 + 0.10 * v0 )   (emotions toward baseline)
+  prog.emit(Op::VSCALE_ADD, /*a=*/1, /*b=*/0, /*c=*/3 /*use s3 as gain placeholder*/);
+  // prepare s3=0.10
+  prog.emit(Op::MOV_SI, /*a=*/3,0,0, 0.10f);
+  // re-run VSCALE_ADD now that s3 is set (demo)
+  prog.emit(Op::VSCALE_ADD, /*a=*/1, /*b=*/0, /*c=*/3);
+  // cognition v2 += 0.12 * v1
+  prog.emit(Op::MOV_SI, /*a=*/4,0,0, 0.12f);
+  prog.emit(Op::VSCALE_ADD, /*a=*/2, /*b=*/1, /*c=*/4);
+  // apply lane-pressure on cognition (rotational push)
+  prog.emit(Op::VPSI, /*a=*/2, /*b=*/2, /*c=*/2 /*psi gain in s2*/);
+  // rotate emotions by +1 to simulate flow
+  prog.emit(Op::VROT, /*a=*/1, /*b=*/1, /*c=*/0, /*fimm=*/0.0f, /*iimm=*/1);
+  // clamp both to [0,1]
+  prog.emit(Op::VCLAMP01, /*a=*/1);
+  prog.emit(Op::VCLAMP01, /*a=*/2);
+  // print snapshot: s0 (time) and first 4 lanes of v2 (cognition)
+  prog.emit(Op::PRINT, /*a=*/0, /*b=*/2);
+  // (Typically you’d HALT at end of a kernel pass; here we just stop)
+  prog.emit(Op::HALT);
+
+  // Run a few steps, advancing observer time
+  for (int step=0; step<10; ++step) {
+    vm.step(prog);
+    clk.tick(0.02); // you own time
+  }
+
+  std::cout << "Done.\n";
+  return 0;
+}
